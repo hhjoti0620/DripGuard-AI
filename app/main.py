@@ -257,8 +257,7 @@ class BedSyncHub:
         if fps <= 1 or fps > 120:
             fps = 30.0
 
-        # Adaptive stride so low-vCPU cloud containers run at real-time speed (~12-15 effective FPS)
-        stride = 3 if fps >= 45 else 2
+        stride = 10 if fps >= 45 else 6
         target_step_sec = stride / fps
 
         frame_idx = 0
@@ -285,7 +284,7 @@ class BedSyncHub:
                         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
                         if fps <= 1 or fps > 120:
                             fps = 30.0
-                        stride = 3 if fps >= 45 else 2
+                        stride = 10 if fps >= 45 else 6
                         target_step_sec = stride / fps
                         engine.reset()
                         frame_idx = 0
@@ -312,13 +311,12 @@ class BedSyncHub:
                 current_idx = frame_idx
                 frame_idx += 1
 
-                # Skip intermediate frames without decoding/inference while preserving exact video timestamp
                 if current_idx % stride != 0:
                     continue
 
                 t = current_idx / fps
                 orig_H, orig_W = fr.shape[:2]
-                out_w = 480
+                out_w = 340
                 out_h = max(1, int(orig_H * (out_w / orig_W)))
                 vis = cv2.resize(fr, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
@@ -357,7 +355,7 @@ class BedSyncHub:
                     cv2.rectangle(vis, (bx1, by1), (bx2, by2), (102, 255, 0), 2)
                     cv2.putText(vis, f"{cf:.2f}", (bx2 + 4, by1 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (102, 255, 0), 1, cv2.LINE_AA)
 
-                _, jpg = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), 68])
+                _, jpg = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), 55])
                 b64_img = base64.b64encode(jpg.tobytes()).decode("ascii")
 
                 if current_idx - last_db_log_idx >= int(fps * 2):
