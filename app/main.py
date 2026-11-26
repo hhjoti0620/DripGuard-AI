@@ -257,11 +257,16 @@ class BedSyncHub:
         if fps <= 1 or fps > 120:
             fps = 30.0
 
-        stride = 10 if fps >= 45 else 6
-        target_step_sec = stride / fps
+        # Stream at smooth visual FPS while running heavy ONNX inference periodically in background
+        visual_stride = 2 if fps >= 45 else 1
+        infer_interval = 12 if fps >= 45 else 6
+        target_step_sec = visual_stride / fps
 
         frame_idx = 0
         last_db_log_idx = -999
+        last_st = None
+        last_xai = None
+        infer_task: Optional[asyncio.Task] = None
 
         try:
             while self.subscribers.get(bed_id):
@@ -284,17 +289,22 @@ class BedSyncHub:
                         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
                         if fps <= 1 or fps > 120:
                             fps = 30.0
-                        stride = 10 if fps >= 45 else 6
-                        target_step_sec = stride / fps
+                        visual_stride = 2 if fps >= 45 else 1
+                        infer_interval = 12 if fps >= 45 else 6
+                        target_step_sec = visual_stride / fps
                         engine.reset()
                         frame_idx = 0
                         last_db_log_idx = -999
+                        last_st = None
+                        last_xai = None
 
                 if bed_id in self.reset_flags:
                     self.reset_flags.discard(bed_id)
                     engine.reset()
                     frame_idx = 0
                     last_db_log_idx = -999
+                    last_st = None
+                    last_xai = None
                     if is_file:
                         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
@@ -311,12 +321,12 @@ class BedSyncHub:
                 current_idx = frame_idx
                 frame_idx += 1
 
-                if current_idx % stride != 0:
+                if current_idx % visual_stride != 0:
                     continue
 
                 t = current_idx / fps
                 orig_H, orig_W = fr.shape[:2]
-                out_w = 340
+                out_w = 320
                 out_h = max(1, int(orig_H * (out_w / orig_W)))
                 vis = cv2.resize(fr, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
@@ -326,19 +336,46 @@ class BedSyncHub:
                 ry1 = max(ry0 + 10, min(out_h, int(roi[3] * out_h)))
                 rw, rh = rx1 - rx0, ry1 - ry0
 
-                roi_crop = vis[ry0:ry1, rx0:rx1]
-                boxes_roi = await asyncio.to_thread(det.detect, roi_crop)
-                st = engine.update(t, boxes_roi)
+                # Collect completed background inference result without blocking video frames
+                if infer_task is not None and infer_task.done():
+                    try:
+                        inf_t, boxes_roi = infer_task.result()
+                        last_st = engine.update(inf_t, boxes_roi)
+                        last_xai = explain_telemetry_decision(
+                            status=last_st.status,
+                            dpm=last_st.dpm,
+                            prescribed_dpm=engine.cfg.prescribed_dpm,
+                            tolerance=engine.cfg.tolerance,
+                            ml_hr=last_st.ml_hr,
+                            drop_factor=engine.cfg.drop_factor,
+                            raw_reason=last_st.reason,
+                        )
+                    except Exception:
+                        pass
+                    infer_task = None
 
-                xai = explain_telemetry_decision(
-                    status=st.status,
-                    dpm=st.dpm,
-                    prescribed_dpm=engine.cfg.prescribed_dpm,
-                    tolerance=engine.cfg.tolerance,
-                    ml_hr=st.ml_hr,
-                    drop_factor=engine.cfg.drop_factor,
-                    raw_reason=st.reason,
-                )
+                # Launch non-blocking inference when worker is idle
+                if infer_task is None and (last_st is None or current_idx % infer_interval == 0):
+                    roi_crop = vis[ry0:ry1, rx0:rx1].copy()
+                    async def _bg_infer(crop, ts):
+                        boxes = await asyncio.to_thread(det.detect, crop)
+                        return ts, boxes
+                    infer_task = asyncio.create_task(_bg_infer(roi_crop, t))
+
+                if last_st is None:
+                    last_st = engine.update(t, [])
+                    last_xai = explain_telemetry_decision(
+                        status=last_st.status,
+                        dpm=last_st.dpm,
+                        prescribed_dpm=engine.cfg.prescribed_dpm,
+                        tolerance=engine.cfg.tolerance,
+                        ml_hr=last_st.ml_hr,
+                        drop_factor=engine.cfg.drop_factor,
+                        raw_reason=last_st.reason,
+                    )
+
+                st = last_st
+                xai = last_xai
 
                 cv2.rectangle(vis, (rx0, ry0), (rx1, ry1), (220, 190, 80), 1)
                 cx1 = int(rx0 + corridor[0] * rw)
@@ -398,7 +435,7 @@ class BedSyncHub:
                     "type": "telemetry",
                     "frame": b64_img,
                     "telemetry": {
-                        "t": round(st.t, 2),
+                        "t": round(t, 2),
                         "total_drops": st.total_drops,
                         "dpm": st.dpm,
                         "ml_hr": st.ml_hr,
@@ -412,11 +449,13 @@ class BedSyncHub:
                 })
 
                 elapsed = time.monotonic() - loop_start
-                sleep_time = max(0.005, target_step_sec - elapsed)
+                sleep_time = max(0.015, target_step_sec - elapsed)
                 await asyncio.sleep(sleep_time)
         except asyncio.CancelledError:
             pass
         finally:
+            if infer_task is not None and not infer_task.done():
+                infer_task.cancel()
             if cap is not None:
                 cap.release()
             self.workers.pop(bed_id, None)
