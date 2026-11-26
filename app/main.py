@@ -257,15 +257,15 @@ class BedSyncHub:
         if fps <= 1 or fps > 120:
             fps = 30.0
 
-        # Stream at smooth visual FPS while running heavy ONNX inference periodically in background
-        visual_stride = 2 if fps >= 45 else 1
-        infer_interval = 12 if fps >= 45 else 6
+        # Real-time visual playback paced by wall-clock time so 0.1 vCPU never lags behind real time
+        visual_stride = 4 if fps >= 45 else 2
         target_step_sec = visual_stride / fps
 
         frame_idx = 0
         last_db_log_idx = -999
         last_st = None
         last_xai = None
+        last_infer_done_at = 0.0
         infer_task: Optional[asyncio.Task] = None
 
         try:
@@ -289,14 +289,14 @@ class BedSyncHub:
                         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
                         if fps <= 1 or fps > 120:
                             fps = 30.0
-                        visual_stride = 2 if fps >= 45 else 1
-                        infer_interval = 12 if fps >= 45 else 6
+                        visual_stride = 4 if fps >= 45 else 2
                         target_step_sec = visual_stride / fps
                         engine.reset()
                         frame_idx = 0
                         last_db_log_idx = -999
                         last_st = None
                         last_xai = None
+                        last_infer_done_at = 0.0
 
                 if bed_id in self.reset_flags:
                     self.reset_flags.discard(bed_id)
@@ -305,6 +305,7 @@ class BedSyncHub:
                     last_db_log_idx = -999
                     last_st = None
                     last_xai = None
+                    last_infer_done_at = 0.0
                     if is_file:
                         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
@@ -326,7 +327,7 @@ class BedSyncHub:
 
                 t = current_idx / fps
                 orig_H, orig_W = fr.shape[:2]
-                out_w = 320
+                out_w = 270
                 out_h = max(1, int(orig_H * (out_w / orig_W)))
                 vis = cv2.resize(fr, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
@@ -336,7 +337,7 @@ class BedSyncHub:
                 ry1 = max(ry0 + 10, min(out_h, int(roi[3] * out_h)))
                 rw, rh = rx1 - rx0, ry1 - ry0
 
-                # Collect completed background inference result without blocking video frames
+                # Collect completed inference and leave a 1.5s CPU breather so video stays 100% real-time
                 if infer_task is not None and infer_task.done():
                     try:
                         inf_t, boxes_roi = infer_task.result()
@@ -353,9 +354,10 @@ class BedSyncHub:
                     except Exception:
                         pass
                     infer_task = None
+                    last_infer_done_at = time.monotonic()
 
-                # Launch non-blocking inference when worker is idle
-                if infer_task is None and (last_st is None or current_idx % infer_interval == 0):
+                now_mono = time.monotonic()
+                if infer_task is None and (last_st is None or (now_mono - last_infer_done_at) >= 1.5):
                     roi_crop = vis[ry0:ry1, rx0:rx1].copy()
                     async def _bg_infer(crop, ts):
                         boxes = await asyncio.to_thread(det.detect, crop)
@@ -392,7 +394,7 @@ class BedSyncHub:
                     cv2.rectangle(vis, (bx1, by1), (bx2, by2), (102, 255, 0), 2)
                     cv2.putText(vis, f"{cf:.2f}", (bx2 + 4, by1 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (102, 255, 0), 1, cv2.LINE_AA)
 
-                _, jpg = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), 55])
+                _, jpg = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), 48])
                 b64_img = base64.b64encode(jpg.tobytes()).decode("ascii")
 
                 if current_idx - last_db_log_idx >= int(fps * 2):
@@ -449,7 +451,7 @@ class BedSyncHub:
                 })
 
                 elapsed = time.monotonic() - loop_start
-                sleep_time = max(0.015, target_step_sec - elapsed)
+                sleep_time = max(0.02, target_step_sec - elapsed)
                 await asyncio.sleep(sleep_time)
         except asyncio.CancelledError:
             pass
@@ -633,401 +635,4 @@ def list_patients(q: Optional[str] = None, db: Session = Depends(get_db), user: 
 
 
 @app.post("/api/patients", status_code=201)
-def create_patient(payload: PatientCreate, db: Session = Depends(get_db), user: User = Depends(require_role("doctor", "admin"))):
-    if db.query(Patient).filter(Patient.mrn == payload.mrn).first():
-        raise HTTPException(status_code=400, detail="Patient MRN already exists")
-    p = Patient(**payload.model_dump())
-    db.add(p)
-    db.commit()
-    db.refresh(p)
-    record_audit(db, user.username, user.role, "CREATE_PATIENT", "Patient", p.id, f"Registered {p.mrn}")
-    return {"id": p.id, "mrn": p.mrn}
-
-
-def _serialize_bed(b: InfusionBed) -> dict:
-    return {
-        "id": b.id,
-        "bed_code": b.bed_code,
-        "ward_name": b.ward_name,
-        "patient_id": b.patient_id,
-        "patient_name": b.patient.full_name if b.patient else "Unassigned",
-        "patient_mrn": b.patient.mrn if b.patient else None,
-        "is_pediatric": b.patient.is_pediatric if b.patient else False,
-        "fluid_type": b.fluid_type,
-        "target_volume_ml": b.target_volume_ml,
-        "target_duration_min": b.target_duration_min,
-        "drop_factor": b.drop_factor,
-        "prescribed_dpm": b.prescribed_dpm,
-        "tolerance": b.tolerance,
-        "video_source": b.video_source,
-        "roi": json.loads(b.roi_json),
-        "corridor": json.loads(b.corridor_json),
-        "lifecycle_state": b.lifecycle_state,
-        "version_id": b.version_id,
-    }
-
-
-@app.get("/api/beds")
-def list_beds(
-    search: Optional[str] = Query(default=None),
-    ward: Optional[str] = Query(default=None),
-    state: Optional[str] = Query(default=None),
-    sort_by: str = Query(default="bed_code", pattern="^(bed_code|ward_name|updated_at|prescribed_dpm)$"),
-    order: str = Query(default="asc", pattern="^(asc|desc)$"),
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    query = db.query(InfusionBed).outerjoin(Patient)
-    if search:
-        like = f"%{search.strip()}%"
-        query = query.filter(
-            or_(
-                InfusionBed.bed_code.ilike(like),
-                InfusionBed.fluid_type.ilike(like),
-                Patient.full_name.ilike(like),
-                Patient.mrn.ilike(like),
-            )
-        )
-    if ward:
-        query = query.filter(InfusionBed.ward_name == ward)
-    if state:
-        query = query.filter(InfusionBed.lifecycle_state == state)
-
-    sort_col = getattr(InfusionBed, sort_by)
-    query = query.order_by(sort_col.desc() if order == "desc" else sort_col.asc())
-    return [_serialize_bed(b) for b in query.all()]
-
-
-@app.get("/api/ward/summary")
-def ward_aggregation(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    total_beds = db.query(func.count(InfusionBed.id)).scalar() or 0
-    running_beds = db.query(func.count(InfusionBed.id)).filter(InfusionBed.lifecycle_state == "RUNNING").scalar() or 0
-    unacked_alerts = db.query(func.count(Alert.id)).filter(Alert.acknowledged == False).scalar() or 0
-    total_drops = db.query(func.coalesce(func.sum(TelemetryLog.total_drops), 0)).scalar() or 0
-    by_ward = db.query(InfusionBed.ward_name, func.count(InfusionBed.id)).group_by(InfusionBed.ward_name).all()
-    return {
-        "total_beds": total_beds,
-        "running_beds": running_beds,
-        "unacknowledged_alerts": unacked_alerts,
-        "logged_drop_events": total_drops,
-        "beds_by_ward": {w: c for w, c in by_ward},
-    }
-
-
-@app.post("/api/beds", status_code=201)
-def create_bed(payload: BedCreate, db: Session = Depends(get_db), user: User = Depends(require_role("doctor", "admin"))):
-    if db.query(InfusionBed).filter(InfusionBed.bed_code == payload.bed_code).first():
-        raise HTTPException(status_code=400, detail="Bed code already exists")
-    validate_safe_video_source(payload.video_source)
-
-    patient = None
-    if payload.patient_id is not None:
-        patient = db.query(Patient).filter(Patient.id == payload.patient_id).first()
-        if not patient:
-            raise HTTPException(status_code=404, detail=f"Patient id {payload.patient_id} not found")
-
-    ev = evaluate_infusion_order(
-        prescribed_dpm=payload.prescribed_dpm,
-        drop_factor=payload.drop_factor,
-        target_volume_ml=payload.target_volume_ml,
-        target_duration_min=payload.target_duration_min,
-        patient_weight_kg=patient.weight_kg if patient else None,
-        is_pediatric=patient.is_pediatric if patient else False,
-    )
-    if not ev.feasible:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": ev.explanation,
-                "violated_constraints": ev.violated_constraints,
-                "recommended_adjustment": ev.recommended_adjustment,
-            },
-        )
-
-    bed = InfusionBed(
-        bed_code=payload.bed_code,
-        ward_name=payload.ward_name,
-        patient_id=payload.patient_id,
-        fluid_type=payload.fluid_type,
-        target_volume_ml=payload.target_volume_ml,
-        target_duration_min=payload.target_duration_min,
-        drop_factor=payload.drop_factor,
-        prescribed_dpm=payload.prescribed_dpm,
-        tolerance=payload.tolerance,
-        video_source=payload.video_source,
-        roi_json=json.dumps(payload.roi),
-        corridor_json=json.dumps(payload.corridor),
-        lifecycle_state="ORDERED",
-    )
-    db.add(bed)
-    db.commit()
-    db.refresh(bed)
-    record_audit(db, user.username, user.role, "CREATE_BED", "InfusionBed", bed.id, f"Created {bed.bed_code}")
-    return _serialize_bed(bed)
-
-
-@app.patch("/api/beds/{bed_id}")
-async def update_bed(bed_id: int, payload: BedUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    bed = db.query(InfusionBed).filter(InfusionBed.id == bed_id).first()
-    if not bed:
-        raise HTTPException(status_code=404, detail="Bed not found")
-
-    provided = payload.model_dump(exclude_unset=True)
-    if ("prescribed_dpm" in provided or payload.clear_prescribed_dpm) and user.role not in ("doctor", "admin"):
-        raise HTTPException(status_code=403, detail="Only doctors or admins may modify prescribed DPM")
-
-    updates = {}
-    if "ward_name" in provided:
-        updates["ward_name"] = payload.ward_name
-    if "patient_id" in provided:
-        if payload.patient_id is not None:
-            target_patient = db.query(Patient).filter(Patient.id == payload.patient_id).first()
-            if not target_patient:
-                raise HTTPException(status_code=404, detail=f"Patient id {payload.patient_id} not found")
-        updates["patient_id"] = payload.patient_id
-    if "fluid_type" in provided:
-        updates["fluid_type"] = payload.fluid_type
-    if "target_volume_ml" in provided:
-        updates["target_volume_ml"] = payload.target_volume_ml
-    if "target_duration_min" in provided:
-        updates["target_duration_min"] = payload.target_duration_min
-    if "drop_factor" in provided:
-        updates["drop_factor"] = payload.drop_factor
-    if payload.clear_prescribed_dpm:
-        updates["prescribed_dpm"] = None
-    elif "prescribed_dpm" in provided:
-        updates["prescribed_dpm"] = payload.prescribed_dpm
-    if "tolerance" in provided:
-        updates["tolerance"] = payload.tolerance
-
-    if "lifecycle_state" in provided and payload.lifecycle_state:
-        ok_tr, msg_tr = validate_lifecycle_transition(bed.lifecycle_state, payload.lifecycle_state)
-        if not ok_tr:
-            raise HTTPException(status_code=422, detail=msg_tr)
-        updates["lifecycle_state"] = payload.lifecycle_state
-
-    source_changed = False
-    if "video_source" in provided and payload.video_source:
-        validate_safe_video_source(payload.video_source)
-        if payload.video_source != bed.video_source:
-            source_changed = True
-        updates["video_source"] = payload.video_source
-        for k, v in VIDEO_PRESETS.items():
-            if k in payload.video_source and "roi" not in provided:
-                updates["roi_json"] = json.dumps(v["roi"])
-                updates["corridor_json"] = json.dumps(v["corridor"])
-
-    if "roi" in provided and payload.roi is not None:
-        updates["roi_json"] = json.dumps(payload.roi)
-    if "corridor" in provided and payload.corridor is not None:
-        updates["corridor_json"] = json.dumps(payload.corridor)
-
-    eff_dpm = updates.get("prescribed_dpm", bed.prescribed_dpm)
-    eff_df = updates.get("drop_factor", bed.drop_factor)
-    eff_vol = updates.get("target_volume_ml", bed.target_volume_ml)
-    eff_dur = updates.get("target_duration_min", bed.target_duration_min)
-    eff_patient_id = updates.get("patient_id", bed.patient_id)
-    patient = db.query(Patient).filter(Patient.id == eff_patient_id).first() if eff_patient_id else None
-
-    if eff_dpm is not None:
-        ev = evaluate_infusion_order(
-            prescribed_dpm=eff_dpm,
-            drop_factor=eff_df,
-            target_volume_ml=eff_vol,
-            target_duration_min=eff_dur,
-            patient_weight_kg=patient.weight_kg if patient else None,
-            is_pediatric=patient.is_pediatric if patient else False,
-        )
-        if not ev.feasible:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "message": ev.explanation,
-                    "violated_constraints": ev.violated_constraints,
-                    "recommended_adjustment": ev.recommended_adjustment,
-                },
-            )
-
-    if not atomic_bed_update(db, bed_id, payload.version_id, updates):
-        latest = db.query(InfusionBed).filter(InfusionBed.id == bed_id).first()
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": f"Conflict: Bed modified concurrently (server v{latest.version_id} != your v{payload.version_id}). Auto-refreshing.",
-                "latest_bed": _serialize_bed(latest),
-            },
-        )
-
-    db.expire_all()
-    updated_bed = db.query(InfusionBed).filter(InfusionBed.id == bed_id).first()
-    record_audit(db, user.username, user.role, "UPDATE_BED", "InfusionBed", bed_id, f"Updated fields: {list(updates.keys())}")
-
-    serialized = _serialize_bed(updated_bed)
-    if source_changed:
-        sync_hub.source_reload_flags.add(bed_id)
-    sync_hub.live_configs[bed_id] = serialized
-    await sync_hub.broadcast_bed_event(bed_id, {"type": "bed_updated", "bed": serialized, "updated_by": user.username})
-    return serialized
-
-
-@app.delete("/api/beds/{bed_id}")
-def delete_bed(bed_id: int, db: Session = Depends(get_db), user: User = Depends(require_role("admin"))):
-    bed = db.query(InfusionBed).filter(InfusionBed.id == bed_id).first()
-    if not bed:
-        raise HTTPException(status_code=404, detail="Bed not found")
-    if bed.lifecycle_state == "RUNNING" and sync_hub.subscribers.get(bed_id):
-        raise HTTPException(status_code=409, detail="Cannot delete an actively streaming RUNNING bed. Stop or pause it first.")
-    code = bed.bed_code
-    db.delete(bed)
-    db.commit()
-    record_audit(db, user.username, user.role, "DELETE_BED", "InfusionBed", bed_id, f"Deleted bed {code}")
-    return {"status": "deleted", "bed_code": code}
-
-
-@app.get("/api/alerts")
-def list_alerts(
-    acknowledged: Optional[bool] = None,
-    bed_id: Optional[int] = None,
-    limit: int = Query(default=30, ge=1, le=200),
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    q = db.query(Alert)
-    if acknowledged is not None:
-        q = q.filter(Alert.acknowledged == acknowledged)
-    if bed_id is not None:
-        q = q.filter(Alert.bed_id == bed_id)
-    rows = q.order_by(Alert.id.desc()).limit(limit).all()
-    return [
-        {
-            "id": a.id,
-            "bed_id": a.bed_id,
-            "bed_code": a.bed.bed_code if a.bed else str(a.bed_id),
-            "severity": a.severity,
-            "alert_type": a.alert_type,
-            "message": a.message,
-            "acknowledged": a.acknowledged,
-            "acknowledged_by": a.acknowledged_by,
-            "created_at": a.created_at.isoformat(),
-        }
-        for a in rows
-    ]
-
-
-@app.post("/api/alerts/{alert_id}/ack")
-def acknowledge_alert(alert_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    alert = db.query(Alert).filter(Alert.id == alert_id).first()
-    if not alert:
-        raise HTTPException(status_code=404, detail="Alert not found")
-    if alert.acknowledged:
-        return {"status": "already_acknowledged", "id": alert.id, "acknowledged_by": alert.acknowledged_by}
-    alert.acknowledged = True
-    alert.acknowledged_by = user.username
-    db.commit()
-    record_audit(db, user.username, user.role, "ACK_ALERT", "Alert", alert_id, f"Acknowledged {alert.alert_type}")
-    return {"status": "acknowledged", "id": alert.id}
-
-
-@app.get("/api/beds/{bed_id}/logs")
-def get_bed_logs(bed_id: int, limit: int = Query(default=30, ge=1, le=200), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    rows = (
-        db.query(TelemetryLog)
-        .filter(TelemetryLog.bed_id == bed_id)
-        .order_by(TelemetryLog.id.desc())
-        .limit(limit)
-        .all()
-    )
-    return [
-        {
-            "t": r.timestamp.isoformat(),
-            "drops": r.total_drops,
-            "dpm": r.dpm,
-            "ml_hr": r.ml_hr,
-            "ml_infused": r.ml_infused,
-            "status": r.status,
-            "confidence": r.confidence,
-            "reason": r.reason,
-        }
-        for r in reversed(rows)
-    ]
-
-
-@app.get("/api/audit-logs")
-def get_audit_logs(limit: int = Query(default=40, ge=1, le=200), db: Session = Depends(get_db), user: User = Depends(require_role("doctor", "admin"))):
-    rows = db.query(AuditLog).order_by(AuditLog.id.desc()).limit(limit).all()
-    return [
-        {
-            "id": r.id,
-            "actor": r.actor,
-            "role": r.role,
-            "action": r.action,
-            "target": f"{r.target_type}:{r.target_id}",
-            "detail": r.detail,
-            "timestamp": r.timestamp.isoformat(),
-        }
-        for r in rows
-    ]
-
-
-@app.websocket("/ws/stream/{bed_id}")
-async def stream_bed_telemetry(websocket: WebSocket, bed_id: int, user: Optional[User] = Depends(get_ws_user)):
-    if user is None:
-        await websocket.close(code=4401, reason="Unauthorized WebSocket token")
-        return
-
-    await websocket.accept()
-    sync_hub.subscribers.setdefault(bed_id, set()).add(websocket)
-    sync_hub.ensure_worker(bed_id, user.username)
-
-    try:
-        while True:
-            msg = await websocket.receive_text()
-            cmd = json.loads(msg)
-            if cmd.get("action") == "reset":
-                sync_hub.reset_flags.add(bed_id)
-                await sync_hub.broadcast_bed_event(bed_id, {"type": "counter_reset", "by": user.username})
-            elif cmd.get("action") == "config":
-                if "prescribed_dpm" in cmd and user.role not in ("doctor", "admin"):
-                    await websocket.send_json({"type": "error", "detail": "Only doctors or admins may modify prescribed DPM"})
-                    continue
-
-                db = SessionLocal()
-                try:
-                    bed = db.query(InfusionBed).filter(InfusionBed.id == bed_id).first()
-                    if not bed:
-                        continue
-                    eff_dpm = cmd.get("prescribed_dpm", bed.prescribed_dpm)
-                    eff_df = float(cmd.get("drop_factor", bed.drop_factor))
-                    if eff_dpm is not None:
-                        ev = evaluate_infusion_order(
-                            prescribed_dpm=eff_dpm,
-                            drop_factor=eff_df,
-                            target_volume_ml=bed.target_volume_ml,
-                            target_duration_min=bed.target_duration_min,
-                            patient_weight_kg=bed.patient.weight_kg if bed.patient else None,
-                            is_pediatric=bed.patient.is_pediatric if bed.patient else False,
-                        )
-                        if not ev.feasible:
-                            await websocket.send_json({
-                                "type": "error",
-                                "detail": ev.explanation,
-                                "recommended_adjustment": ev.recommended_adjustment,
-                            })
-                            continue
-
-                    cfg_payload = sync_hub.live_configs.get(bed_id, _serialize_bed(bed))
-                    if "prescribed_dpm" in cmd:
-                        cfg_payload["prescribed_dpm"] = cmd["prescribed_dpm"]
-                    if "drop_factor" in cmd and float(cmd["drop_factor"]) > 0:
-                        cfg_payload["drop_factor"] = float(cmd["drop_factor"])
-                    if "roi" in cmd and len(cmd["roi"]) == 4:
-                        cfg_payload["roi"] = cmd["roi"]
-                    if "corridor" in cmd and len(cmd["corridor"]) == 4:
-                        cfg_payload["corridor"] = cmd["corridor"]
-                    sync_hub.live_configs[bed_id] = cfg_payload
-                finally:
-                    db.close()
-    except WebSocketDisconnect:
-        pass
-    finally:
-        sync_hub.subscribers.get(bed_id, set()).discard(websocket)
+def create_patient(payload: PatientCreate, db: Session = Depends(get_db
