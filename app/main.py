@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -255,13 +256,17 @@ class BedSyncHub:
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         if fps <= 1 or fps > 120:
             fps = 30.0
-        frame_delay = 1.0 / min(fps, 30.0)
+
+        # Adaptive stride so low-vCPU cloud containers run at real-time speed (~12-15 effective FPS)
+        stride = 3 if fps >= 45 else 2
+        target_step_sec = stride / fps
 
         frame_idx = 0
         last_db_log_idx = -999
 
         try:
             while self.subscribers.get(bed_id):
+                loop_start = time.monotonic()
                 pushed = self.live_configs.pop(bed_id, None)
                 if pushed:
                     engine.cfg.prescribed_dpm = pushed["prescribed_dpm"]
@@ -277,6 +282,11 @@ class BedSyncHub:
                         if cap is None:
                             await self.broadcast_bed_event(bed_id, {"error": f"Video not found: {pushed['video_source']}"})
                             break
+                        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                        if fps <= 1 or fps > 120:
+                            fps = 30.0
+                        stride = 3 if fps >= 45 else 2
+                        target_step_sec = stride / fps
                         engine.reset()
                         frame_idx = 0
                         last_db_log_idx = -999
@@ -299,16 +309,26 @@ class BedSyncHub:
                         continue
                     break
 
-                H, W = fr.shape[:2]
-                t = frame_idx / fps
+                current_idx = frame_idx
+                frame_idx += 1
 
-                rx0 = max(0, min(W - 10, int(roi[0] * W)))
-                ry0 = max(0, min(H - 10, int(roi[1] * H)))
-                rx1 = max(rx0 + 10, min(W, int(roi[2] * W)))
-                ry1 = max(ry0 + 10, min(H, int(roi[3] * H)))
+                # Skip intermediate frames without decoding/inference while preserving exact video timestamp
+                if current_idx % stride != 0:
+                    continue
+
+                t = current_idx / fps
+                orig_H, orig_W = fr.shape[:2]
+                out_w = 480
+                out_h = max(1, int(orig_H * (out_w / orig_W)))
+                vis = cv2.resize(fr, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
+                rx0 = max(0, min(out_w - 10, int(roi[0] * out_w)))
+                ry0 = max(0, min(out_h - 10, int(roi[1] * out_h)))
+                rx1 = max(rx0 + 10, min(out_w, int(roi[2] * out_w)))
+                ry1 = max(ry0 + 10, min(out_h, int(roi[3] * out_h)))
                 rw, rh = rx1 - rx0, ry1 - ry0
 
-                roi_crop = fr[ry0:ry1, rx0:rx1]
+                roi_crop = vis[ry0:ry1, rx0:rx1]
                 boxes_roi = await asyncio.to_thread(det.detect, roi_crop)
                 st = engine.update(t, boxes_roi)
 
@@ -322,31 +342,26 @@ class BedSyncHub:
                     raw_reason=st.reason,
                 )
 
-                out_w = 440
-                out_h = int(H * (out_w / W))
-                vis = cv2.resize(fr, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
-                sx, sy = out_w / W, out_h / H
-
-                cv2.rectangle(vis, (int(rx0 * sx), int(ry0 * sy)), (int(rx1 * sx), int(ry1 * sy)), (220, 190, 80), 1)
-                cx1 = int((rx0 + corridor[0] * rw) * sx)
-                cy1 = int((ry0 + corridor[1] * rh) * sy)
-                cx2 = int((rx0 + corridor[2] * rw) * sx)
-                cy2 = int((ry0 + corridor[3] * rh) * sy)
+                cv2.rectangle(vis, (rx0, ry0), (rx1, ry1), (220, 190, 80), 1)
+                cx1 = int(rx0 + corridor[0] * rw)
+                cy1 = int(ry0 + corridor[1] * rh)
+                cx2 = int(rx0 + corridor[2] * rw)
+                cy2 = int(ry0 + corridor[3] * rh)
                 cv2.rectangle(vis, (cx1, cy1), (cx2, cy2), (56, 189, 248), 2)
 
                 for x1, y1, x2, y2, cf in st.boxes:
-                    bx1 = int((rx0 + x1 * rw) * sx)
-                    by1 = int((ry0 + y1 * rh) * sy)
-                    bx2 = int((rx0 + x2 * rw) * sx)
-                    by2 = int((ry0 + y2 * rh) * sy)
+                    bx1 = int(rx0 + x1 * rw)
+                    by1 = int(ry0 + y1 * rh)
+                    bx2 = int(rx0 + x2 * rw)
+                    by2 = int(ry0 + y2 * rh)
                     cv2.rectangle(vis, (bx1, by1), (bx2, by2), (102, 255, 0), 2)
                     cv2.putText(vis, f"{cf:.2f}", (bx2 + 4, by1 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (102, 255, 0), 1, cv2.LINE_AA)
 
-                _, jpg = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), 76])
+                _, jpg = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), 68])
                 b64_img = base64.b64encode(jpg.tobytes()).decode("ascii")
 
-                if frame_idx - last_db_log_idx >= int(fps * 2):
-                    last_db_log_idx = frame_idx
+                if current_idx - last_db_log_idx >= int(fps * 2):
+                    last_db_log_idx = current_idx
                     log_db = SessionLocal()
                     try:
                         log_db.add(TelemetryLog(
@@ -359,7 +374,6 @@ class BedSyncHub:
                             confidence=st.confidence,
                             reason=st.reason,
                         ))
-                        # M06 Duplicate-Action Guard: Avoid spamming duplicate unacknowledged alerts
                         if st.status in ("FAST", "SLOW", "STOPPED_OR_OCCLUDED"):
                             existing_open = (
                                 log_db.query(Alert)
@@ -399,8 +413,9 @@ class BedSyncHub:
                     },
                 })
 
-                frame_idx += 1
-                await asyncio.sleep(frame_delay)
+                elapsed = time.monotonic() - loop_start
+                sleep_time = max(0.005, target_step_sec - elapsed)
+                await asyncio.sleep(sleep_time)
         except asyncio.CancelledError:
             pass
         finally:
@@ -935,7 +950,6 @@ async def stream_bed_telemetry(websocket: WebSocket, bed_id: int, user: Optional
                 sync_hub.reset_flags.add(bed_id)
                 await sync_hub.broadcast_bed_event(bed_id, {"type": "counter_reset", "by": user.username})
             elif cmd.get("action") == "config":
-                # M03 + A02 Guard on WebSocket Config Channel
                 if "prescribed_dpm" in cmd and user.role not in ("doctor", "admin"):
                     await websocket.send_json({"type": "error", "detail": "Only doctors or admins may modify prescribed DPM"})
                     continue
